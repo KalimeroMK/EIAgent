@@ -1,219 +1,129 @@
-import json
-import logging
-import os
-import shlex
-import subprocess
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
-
-import requests
-from flask import Flask, jsonify, request
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s in %(module)s: %(message)s",
-)
+from flask import Flask, request, jsonify
+import os, requests, subprocess, shlex
 
 app = Flask(__name__)
 
-API_TOKEN = os.environ.get("API_TOKEN", "")
-MODEL_NAME = os.environ.get("MODEL_NAME", "qwen2.5-coder:7b")
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-AGENT_PORT = int(os.environ.get("AGENT_PORT", "6969"))
+API_TOKEN   = os.environ.get("API_TOKEN", "")
+MODEL_NAME  = os.environ.get("MODEL_NAME", "qwen2.5-coder:7b")
+OLLAMA_BASE = os.environ.get("OLLAMA_BASE", "http://ollama:11434")
+BIND        = os.environ.get("BIND", "0.0.0.0")
+PORT        = int(os.environ.get("PORT", "6969"))
 
-ALLOWED_COMMANDS = {
-    "composer",
-    "php",
-    "git",
-    "npm",
-    "yarn",
-    "mkdir",
-    "mv",
-    "cp",
-    "ls",
-    "chmod",
-    "phpstan",
-    "php-cs-fixer",
-}
+# Allow/Block lists for shell (safety)
+ALLOW_CMDS   = [c.strip() for c in os.environ.get(
+    "ALLOW_CMDS",
+    "composer,php,git,npm,pnpm,yarn,mkdir,cp,mv,ls,chmod,php-cs-fixer,phpstan"
+).split(",")]
 
-BLOCKED_TOKENS = {
-    "rm",
-    "sudo",
-    "curl",
-    "wget",
-    "chmod 777",
-    "mkfs",
-    "dd",
-    ":(){",
-}
+BLOCK_TOKENS = [t.strip() for t in os.environ.get(
+    "BLOCK_TOKENS",
+    " rm , sudo , curl , wget , chmod 777 , :(){ , mkfs , dd "
+).split(",")]
 
+DEFAULT_SYSTEM = (
+    "You are a senior Laravel/PHP and full-stack coding assistant. "
+    "Write clean, modern code with brief English comments. Keep responses concise."
+)
 
-class AgentProxyError(Exception):
-    """Raised when the agent proxy cannot satisfy the request."""
-
-
-class ShellExecutionError(AgentProxyError):
-    """Raised when an allowed shell command fails."""
-
-
-def call_ollama(prompt: str) -> str:
-    """Call the Ollama REST API and return the model response."""
-
-    payload = {"model": MODEL_NAME, "prompt": prompt, "stream": False}
+def ensure_model():
+    """Ensure the model exists in Ollama; pull 7B base if missing."""
     try:
-        response = requests.post(
-            f"{OLLAMA_BASE_URL}/api/generate",
-            json=payload,
-            timeout=600,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:  # pragma: no cover - runtime safety
-        logging.error("Failed to reach Ollama: %s", exc)
-        raise AgentProxyError(f"Failed to reach Ollama: {exc}") from exc
-
+        r = requests.get(f"{OLLAMA_BASE}/api/tags", timeout=15)
+        r.raise_for_status()
+        names = {m.get("name") for m in r.json().get("models", [])}
+        if MODEL_NAME in names:
+            return
+    except Exception:
+        pass
     try:
-        data = response.json()
-    except json.JSONDecodeError as exc:  # pragma: no cover - runtime safety
-        logging.error("Invalid JSON from Ollama: %s", exc)
-        raise AgentProxyError("Invalid JSON response from Ollama") from exc
+        requests.post(f"{OLLAMA_BASE}/api/pull", json={"name": "qwen2.5-coder:7b"}, timeout=600)
+    except Exception:
+        pass
 
-    output = data.get("response", "")
-    if not isinstance(output, str):
-        raise AgentProxyError("Unexpected Ollama response format")
+def call_ollama(prompt, system):
+    """Sync call to Ollama /api/generate (no stream)."""
+    payload = {"model": MODEL_NAME, "prompt": f"{system}\n\n{prompt}", "stream": False}
+    r = requests.post(f"{OLLAMA_BASE}/api/generate", json=payload, timeout=900)
+    r.raise_for_status()
+    data = r.json()
+    return (data.get("response") or "").strip()
 
-    return output
-
-
-def ensure_directory(path: Path) -> None:
-    if not path.exists():
-        path.mkdir(parents=True, exist_ok=True)
-
-
-def write_files(entries: Iterable[Dict[str, Any]]) -> List[str]:
-    results: List[str] = []
-    for entry in entries or []:
-        path_value = entry.get("path")
-        content = entry.get("content", "")
-        if not path_value:
-            raise AgentProxyError("File entry missing 'path'")
-
-        file_path = Path(path_value).expanduser()
-        if file_path.suffix == "":
-            logging.debug("Writing file without extension: %s", file_path)
-
-        if file_path.parent != Path(""):
-            ensure_directory(file_path.parent)
-
-        try:
-            file_path.write_text(content, encoding="utf-8")
-        except OSError as exc:
-            logging.error("Failed to write file %s: %s", file_path, exc)
-            raise AgentProxyError(f"Failed to write file {file_path}: {exc}") from exc
-
-        results.append(f"wrote:{file_path}")
-        logging.info("Wrote file %s", file_path)
-    return results
-
-
-def validate_command(command: str) -> List[str]:
-    if any(token in command for token in BLOCKED_TOKENS):
-        raise AgentProxyError("Command contains blocked token")
-
-    try:
-        parts = shlex.split(command)
-    except ValueError as exc:
-        raise AgentProxyError(f"Invalid command syntax: {command}") from exc
-
+def sanitize_cmd(line: str):
+    """Allowlist + blocklist for shell commands."""
+    low = f" {line.lower()} "
+    for bad in BLOCK_TOKENS:
+        if bad and bad in low:
+            raise RuntimeError(f"Blocked token: {bad.strip()}")
+    parts = shlex.split(line)
     if not parts:
-        raise AgentProxyError("Empty command provided")
-
-    if parts[0] not in ALLOWED_COMMANDS:
-        raise AgentProxyError(f"Command '{parts[0]}' is not allowed")
-
+        raise RuntimeError("Empty command")
+    root = os.path.basename(parts[0])
+    if root not in ALLOW_CMDS:
+        raise RuntimeError(f"Command not allowed: {root}")
     return parts
 
+def run_shell(commands, workdir):
+    logs = []
+    for line in commands:
+        line = line.strip()
+        if not line:
+            continue
+        parts = sanitize_cmd(line)
+        logs.append(f"$ {' '.join(parts)}")
+        proc = subprocess.Popen(parts, cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        out = proc.communicate()[0]
+        logs.append(out)
+        logs.append(f"[exit {proc.returncode}]")
+        if proc.returncode != 0:
+            break
+    return "\n".join(logs)
 
-def execute_commands(spec: Optional[Dict[str, Any]]) -> str:
-    if not spec:
-        return ""
+@app.before_request
+def auth():
+    if request.headers.get("X-API-KEY", "") != API_TOKEN:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    workdir = spec.get("workdir") or os.getcwd()
-    commands = spec.get("commands") or []
+@app.post("/v1/agent/complete")
+def complete():
+    data = request.get_json(force=True)
+    prompt      = data.get("prompt", "")
+    system      = data.get("system") or DEFAULT_SYSTEM
+    write_files = data.get("write_files") or []  # [{ "path":"/abs/path/file.php", "content":"..." }]
+    run_req     = data.get("run_shell")  or {}   # { "workdir":"/abs/path", "commands":[...] }
 
-    if not isinstance(commands, list):
-        raise AgentProxyError("'commands' must be a list")
+    ensure_model()
 
-    workdir_path = Path(workdir).expanduser()
-    if not workdir_path.exists():
-        raise AgentProxyError(f"Working directory does not exist: {workdir_path}")
+    # 1) Model output
+    try:
+        output = call_ollama(prompt, system)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"ollama: {e}"}), 500
 
-    logs: List[str] = []
-    for raw_command in commands:
-        if not isinstance(raw_command, str):
-            raise AgentProxyError("Commands must be strings")
-
-        parts = validate_command(raw_command)
-        logging.info("Executing command: %s", " ".join(parts))
-
+    # 2) Write files (optional)
+    file_report = []
+    for f in write_files:
         try:
-            result = subprocess.run(  # noqa: S603 - controlled allowlist
-                parts,
-                cwd=str(workdir_path),
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        except OSError as exc:
-            logging.error("Failed to execute command %s: %s", raw_command, exc)
-            raise ShellExecutionError(f"Failed to execute command {raw_command}: {exc}") from exc
+            p = f.get("path"); c = f.get("content", "")
+            if not p or not isinstance(c, str):
+                raise RuntimeError("bad file spec")
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(c)
+            file_report.append(f"wrote: {p} ({len(c)} bytes)")
+        except Exception as e:
+            file_report.append(f"error: {p}: {e}")
 
-        command_log = f"$ {' '.join(parts)}\n{result.stdout}{result.stderr}"
-        logs.append(command_log.strip())
+    # 3) Run shell (optional)
+    shell_log = ""
+    if run_req:
+        try:
+            workdir  = run_req.get("workdir") or os.getcwd()
+            commands = [l for l in (run_req.get("commands") or []) if l.strip()]
+            shell_log = run_shell(commands, workdir)
+        except Exception as e:
+            shell_log = f"shell error: {e}"
 
-        if result.returncode != 0:
-            logging.error(
-                "Command failed with exit code %s: %s", result.returncode, raw_command
-            )
-            raise ShellExecutionError(
-                f"Command '{raw_command}' failed with exit code {result.returncode}"
-            )
-
-    return "\n\n".join(logs)
-
-
-@app.route("/v1/agent/complete", methods=["POST"])
-def complete() -> Any:
-    if API_TOKEN and request.headers.get("X-API-KEY") != API_TOKEN:
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
-
-    try:
-        data = request.get_json(force=True)
-    except Exception:  # pylint: disable=broad-exception-caught
-        return jsonify({"ok": False, "error": "Invalid JSON payload"}), 400
-
-    if not isinstance(data, dict):
-        return jsonify({"ok": False, "error": "Invalid request format"}), 400
-
-    prompt = data.get("prompt")
-    if not isinstance(prompt, str) or not prompt.strip():
-        return jsonify({"ok": False, "error": "Missing 'prompt' field"}), 400
-
-    files_result: List[str] = []
-    shell_logs = ""
-
-    try:
-        files_result = write_files(data.get("write_files", []))
-        shell_logs = execute_commands(data.get("run_shell"))
-        output = call_ollama(prompt)
-    except AgentProxyError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
-
-    return jsonify({"ok": True, "output": output, "files": files_result, "shell": shell_logs})
-
-
-def main() -> None:
-    app.run(host="0.0.0.0", port=AGENT_PORT)
-
+    return jsonify({"ok": True, "output": output, "files": file_report, "shell": shell_log})
 
 if __name__ == "__main__":
-    main()
+    app.run(host=BIND, port=PORT)
