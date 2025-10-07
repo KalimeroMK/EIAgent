@@ -37,8 +37,35 @@ fi
 if [ ! -x "$EIGENT_DIR/eigent" ]; then
   echo "[INFO] Building Eigent CLI"
   if command_exists cargo; then
-    (cd "$EIGENT_DIR" && cargo build --release)
-    cp "$EIGENT_DIR/target/release/eigent" "$EIGENT_DIR/eigent"
+    MANIFEST_DIR=""
+    if [ -f "$EIGENT_DIR/Cargo.toml" ]; then
+      MANIFEST_DIR="$EIGENT_DIR"
+    elif [ -f "$EIGENT_DIR/cli/Cargo.toml" ]; then
+      MANIFEST_DIR="$EIGENT_DIR/cli"
+    else
+      echo "[ERROR] Unable to locate Cargo manifest for Eigent CLI." >&2
+      exit 1
+    fi
+
+    (cd "$EIGENT_DIR" && cargo build --release --manifest-path "$MANIFEST_DIR/Cargo.toml")
+
+    BIN_SOURCE=""
+    for candidate in \
+      "$MANIFEST_DIR/target/release/eigent" \
+      "$EIGENT_DIR/target/release/eigent"; do
+      if [ -f "$candidate" ]; then
+        BIN_SOURCE="$candidate"
+        break
+      fi
+    done
+
+    if [ -z "$BIN_SOURCE" ]; then
+      echo "[ERROR] Eigent binary not found after cargo build." >&2
+      exit 1
+    fi
+
+    cp "$BIN_SOURCE" "$EIGENT_DIR/eigent"
+    chmod +x "$EIGENT_DIR/eigent"
   elif [ -f "$EIGENT_DIR/Makefile" ]; then
     (cd "$EIGENT_DIR" && make build)
     if [ ! -x "$EIGENT_DIR/eigent" ]; then
