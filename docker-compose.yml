@@ -5,8 +5,6 @@ services:
     image: ollama/ollama:latest
     container_name: eigent-ollama
     restart: unless-stopped
-    env_file:
-      - .env
     environment:
       OLLAMA_HOST: 0.0.0.0
     ports:
@@ -37,8 +35,9 @@ services:
       - .env
     environment:
       OLLAMA_BASE_URL: http://ollama:11434
+    working_dir: /workspace
     volumes:
-      - ${EIGENT_BIN:-/opt/eigent/eigent}:/usr/local/bin/eigent:ro
+      - ./:/workspace
     depends_on:
       ollama:
         condition: service_healthy
