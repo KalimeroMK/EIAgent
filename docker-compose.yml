@@ -3,45 +3,30 @@ services:
     image: ollama/ollama:latest
     container_name: eigent-ollama
     restart: unless-stopped
-    environment:
-      OLLAMA_HOST: 0.0.0.0
     ports:
       - "11434:11434"
-    volumes:
-      - ollama-data:/root/.ollama
     healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    # GPU acceleration (e.g. Tesla T4) can be enabled by uncommenting the lines below
-    # and ensuring the NVIDIA Container Toolkit is installed on the host.
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
+      test: ["CMD", "curl", "-fsS", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - eigent-ollama-data:/root/.ollama
 
   agent-proxy:
     build:
       context: ./agent-proxy
     container_name: eigent-agent-proxy
     restart: unless-stopped
+    depends_on:
+      - ollama
     env_file:
       - .env
-    environment:
-      OLLAMA_BASE_URL: http://ollama:11434
-    working_dir: /workspace
-    volumes:
-      - ./:/workspace
-    depends_on:
-      ollama:
-        condition: service_healthy
     ports:
-      - "${AGENT_PORT:-6969}:6969"
+      - "6969:6969"
+    # не ставај working_dir и не ставај command тука – го задаваме во Dockerfile
+    # ако сакaш експлицитно:
+    # command: ["python", "/app/agent_proxy.py"]
 
 volumes:
-  ollama-data:
-    name: eigent-ollama-data
+  eigent-ollama-data:
